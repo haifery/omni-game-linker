@@ -77,10 +77,12 @@ def _settings_path() -> str:
 
 def load_settings() -> dict:
     defaults = {
-        "accent":      "Red",
-        "debug":       False,
-        "output_dir":  "",
-        "plugin_dir":  "",
+        "accent":         "Red",
+        "debug":          False,
+        "output_dir":     "",
+        "plugin_dir":     "",
+        "update_prompt":  True,   # show update prompt on startup
+        "pending_update": "",     # path to a downloaded installer waiting to run
     }
     try:
         with open(_settings_path(), "r", encoding="utf-8") as f:
@@ -96,6 +98,99 @@ def save_settings(settings: dict):
             json.dump(settings, f, indent=2)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Update system
+# ---------------------------------------------------------------------------
+
+GITHUB_REPO  = "haifery/omni-game-linker"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_DIR   = os.path.join(
+    os.path.expandvars(r"%APPDATA%") if sys.platform == "win32"
+    else os.path.expanduser("~"),
+    "OmniGameLinker", "update")
+
+
+def _version_tuple(v: str) -> tuple:
+    """Convert 'v1.2.0' or '1.2.0' to (1, 2, 0) for comparison."""
+    try:
+        return tuple(int(x) for x in v.lstrip("v").split("."))
+    except ValueError:
+        return (0,)
+
+
+def check_for_updates() -> tuple | None:
+    """
+    Check GitHub releases API for a newer version.
+    Returns (latest_version_str, asset_download_url) or None.
+    Never raises.
+    """
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            RELEASES_API,
+            headers={"User-Agent": f"OmniGameLinker/{APP_VERSION}",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+
+        latest_tag = data.get("tag_name", "")
+        if not latest_tag:
+            return None
+        if _version_tuple(latest_tag) <= _version_tuple(APP_VERSION):
+            return None
+
+        # Find the Setup .exe asset
+        download_url = RELEASES_URL
+        for asset in data.get("assets", []):
+            name = asset.get("name", "")
+            if name.endswith(".exe") and "Setup" in name:
+                download_url = asset.get("browser_download_url")
+                break
+
+        return latest_tag, download_url
+    except Exception:
+        return None
+
+
+def download_update(url: str, progress_callback=None) -> str | None:
+    """
+    Download installer to UPDATE_DIR.
+    progress_callback(bytes_done, total_bytes) called each chunk.
+    Returns local path on success, None on failure. Never raises.
+    """
+    try:
+        import urllib.request
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        filename = url.split("/")[-1] or "OmniGameLinker_update.exe"
+        dest     = os.path.join(UPDATE_DIR, filename)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"OmniGameLinker/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total      = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, total)
+        return dest
+    except Exception:
+        # Clean up partial file if it exists
+        try:
+            dest_path = os.path.join(UPDATE_DIR,
+                url.split("/")[-1] or "OmniGameLinker_update.exe")
+            if os.path.isfile(dest_path):
+                os.unlink(dest_path)
+        except Exception:
+            pass
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1171,12 @@ class App:
         self._log(f"  Version {APP_VERSION}", "info")
         self._reload_plugins(silent=False)
 
+        # Run any pending update that was downloaded on a previous session
+        self.root.after(500, self._run_pending_update)
+        # Silent startup update check
+        if self._settings.get("update_prompt", True):
+            self.root.after(2000, self._startup_update_check)
+
     # ── Exception handler ────────────────────────────────────────────────────
 
     def _handle_uncaught_exception(self, exc_type, exc_value, exc_tb):
@@ -1088,6 +1189,206 @@ class App:
         self._settings["debug"]      = self._debug_mode.get()
         self._settings["output_dir"] = self.output_dir.get().strip()
         save_settings(self._settings)
+
+    # ── Update system ─────────────────────────────────────────────────────────
+
+    def _run_pending_update(self):
+        """On startup, check if a downloaded installer is waiting to run."""
+        pending = self._settings.get("pending_update", "").strip()
+        if not pending or not os.path.isfile(pending):
+            if pending:
+                # File is gone — clear the stale entry
+                self._settings["pending_update"] = ""
+                self._save()
+            return
+
+        run = messagebox.askyesno(
+            "Update ready",
+            f"An update for Omni Game Linker is ready to install.\n\n"
+            f"Would you like to install it now?\n\n"
+            f"The app will close and the installer will run.",
+            icon="info")
+
+        if run:
+            try:
+                subprocess.Popen([pending, "/SILENT"])
+                self._settings["pending_update"] = ""
+                self._save()
+                self.root.after(500, self.root.destroy)
+            except Exception as e:
+                messagebox.showerror("Update failed",
+                    f"Could not launch the installer:\n{e}\n\n"
+                    f"You can run it manually from:\n{pending}")
+        else:
+            # User declined — clear it so we don't ask again
+            self._settings["pending_update"] = ""
+            self._save()
+
+    def _startup_update_check(self):
+        """Silent background check — only shows UI if update is found."""
+        def check():
+            result = check_for_updates()
+            if result:
+                self.root.after(0, lambda: self._show_update_prompt(*result,
+                                                                     silent=True))
+        threading.Thread(target=check, daemon=True).start()
+
+    def _manual_update_check(self, status_label=None):
+        """Manual check triggered from Version dialog."""
+        if status_label:
+            status_label.configure(text="Checking…", text_color=Palette.MUTED)
+
+        def check():
+            result = check_for_updates()
+            if result:
+                self.root.after(0, lambda: self._show_update_prompt(*result,
+                                                                     silent=False))
+            else:
+                def _no_update():
+                    if status_label:
+                        status_label.configure(
+                            text="✓  You're up to date.", text_color=Palette.SUCCESS)
+                    else:
+                        messagebox.showinfo("Up to date",
+                            f"You're running the latest version ({APP_VERSION}).")
+                self.root.after(0, _no_update)
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _show_update_prompt(self, latest: str, download_url: str,
+                            silent: bool = False):
+        """Show the update available dialog with all three options."""
+        win = ctk.CTkToplevel(self.root)
+        win.title("Update Available")
+        win.geometry("440x320")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="Update Available", font=FONT_TITLE).pack(
+            anchor="w", padx=24, pady=(20, 4))
+        ctk.CTkLabel(win,
+                     text=f"Version {latest} is available.\nYou are running {APP_VERSION}.",
+                     font=FONT_MAIN, text_color=Palette.MUTED).pack(
+            anchor="w", padx=24, pady=(0, 20))
+
+        # Progress bar (hidden until download starts)
+        progress_frame = ctk.CTkFrame(win, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=24, pady=(0, 8))
+        progress_bar   = ctk.CTkProgressBar(progress_frame)
+        progress_label = ctk.CTkLabel(progress_frame, text="", font=FONT_SMALL,
+                                      text_color=Palette.MUTED)
+
+        def _show_progress():
+            progress_bar.set(0)
+            progress_bar.pack(fill="x", pady=(0, 4))
+            progress_label.pack(anchor="w")
+            for btn in (btn_now, btn_next, btn_releases, btn_skip):
+                btn.configure(state="disabled")
+
+        def _update_progress(done, total):
+            if total > 0:
+                pct = done / total
+                self.root.after(0, lambda p=pct, d=done, t=total: (
+                    progress_bar.set(p),
+                    progress_label.configure(
+                        text=f"Downloading… {done//1024//1024:.1f} MB / "
+                             f"{total//1024//1024:.1f} MB ({p*100:.0f}%)")))
+            else:
+                self.root.after(0, lambda d=done: progress_label.configure(
+                    text=f"Downloading… {d//1024//1024:.1f} MB"))
+
+        def _on_download_fail():
+            """Cancel update, report error, ask what to do next."""
+            progress_bar.pack_forget()
+            progress_label.pack_forget()
+            for btn in (btn_now, btn_next, btn_releases, btn_skip):
+                btn.configure(state="normal")
+            choice = messagebox.askquestion(
+                "Download failed",
+                "The update download failed or was interrupted.\n\n"
+                "Would you like to open the GitHub releases page to download manually?",
+                icon="error",
+                type=messagebox.YESNO)
+            if choice == "yes":
+                import webbrowser
+                webbrowser.open(RELEASES_URL)
+                win.destroy()
+
+        def do_now():
+            """Download then install immediately with /SILENT."""
+            _show_progress()
+            def run():
+                path = download_update(download_url, _update_progress)
+                if path:
+                    self.root.after(0, lambda: _launch_now(path))
+                else:
+                    self.root.after(0, _on_download_fail)
+            threading.Thread(target=run, daemon=True).start()
+
+        def _launch_now(path):
+            try:
+                subprocess.Popen([path, "/SILENT"])
+                win.destroy()
+                self.root.after(500, self.root.destroy)
+            except Exception as e:
+                messagebox.showerror("Launch failed",
+                    f"Could not start the installer:\n{e}")
+
+        def do_next():
+            """Download and save path — will run on next startup."""
+            _show_progress()
+            def run():
+                path = download_update(download_url, _update_progress)
+                if path:
+                    def _save_pending():
+                        self._settings["pending_update"] = path
+                        self._save()
+                        progress_label.configure(
+                            text="✓  Downloaded. Will install on next launch.",
+                            text_color=Palette.SUCCESS)
+                        win.after(1500, win.destroy)
+                    self.root.after(0, _save_pending)
+                else:
+                    self.root.after(0, _on_download_fail)
+            threading.Thread(target=run, daemon=True).start()
+
+        def do_releases():
+            import webbrowser
+            webbrowser.open(RELEASES_URL)
+            win.destroy()
+
+        def do_skip():
+            if silent:
+                self._settings["update_prompt"] = False
+                self._save()
+                self._log("  Update prompt disabled. Re-enable in Settings → Updates.", "info")
+            win.destroy()
+
+        btn_now = ctk.CTkButton(win, text="⚡ Update & Restart Now",
+                                command=do_now, font=FONT_BOLD,
+                                fg_color=Palette.ACCENT,
+                                hover_color=Palette.ACCENT_HOVER)
+        btn_now.pack(fill="x", padx=24, pady=(0, 8))
+
+        btn_next = ctk.CTkButton(win, text="⬇ Download & Update on Next Launch",
+                                 command=do_next, font=FONT_MAIN,
+                                 fg_color="transparent", border_width=1,
+                                 border_color=Palette.ACCENT,
+                                 text_color=Palette.ACCENT)
+        btn_next.pack(fill="x", padx=24, pady=(0, 8))
+
+        btn_releases = ctk.CTkButton(win, text="🌐 Open Releases Page",
+                                     command=do_releases, font=FONT_MAIN,
+                                     fg_color="transparent", border_width=1)
+        btn_releases.pack(fill="x", padx=24, pady=(0, 16))
+
+        btn_skip = ctk.CTkButton(win,
+                                 text="Don't ask again" if silent else "Close",
+                                 command=do_skip, font=FONT_SMALL,
+                                 fg_color="transparent",
+                                 text_color=Palette.MUTED)
+        btn_skip.pack(pady=(0, 12))
 
     # ── Plugin management ────────────────────────────────────────────────────
 
@@ -1489,6 +1790,66 @@ class App:
                           fg_color=Palette.ACCENT, hover_color=Palette.ACCENT_HOVER,
                           font=FONT_BOLD).pack(anchor="w", padx=16, pady=(4, 16))
 
+            # ── Update preferences card ──
+            card_upd = ctk.CTkFrame(pad, corner_radius=8)
+            card_upd.pack(fill="x", pady=(0, 16))
+            ctk.CTkLabel(card_upd, text="Update Preferences",
+                         font=FONT_BOLD).pack(anchor="w", padx=16, pady=(12, 4))
+            ctk.CTkLabel(card_upd,
+                         text="When an update is found on startup, show a prompt "
+                              "with update options. Disable to suppress the prompt "
+                              "— you can still check manually via Menu → Version.",
+                         font=FONT_SMALL, text_color=Palette.MUTED, anchor="w",
+                         wraplength=360, justify="left").pack(
+                fill="x", padx=16, pady=(2, 10))
+
+            update_prompt_var = tk.BooleanVar(
+                value=self._settings.get("update_prompt", True))
+
+            def on_update_toggle():
+                self._settings["update_prompt"] = update_prompt_var.get()
+                self._save()
+                self._log(
+                    f"  Startup update prompt "
+                    f"{'enabled' if update_prompt_var.get() else 'disabled'}.",
+                    "info")
+
+            ctk.CTkCheckBox(card_upd,
+                            text="Show update prompt on startup",
+                            variable=update_prompt_var,
+                            command=on_update_toggle,
+                            font=FONT_MAIN).pack(anchor="w", padx=16, pady=(0, 4))
+
+            # Show if a pending update is waiting
+            pending = self._settings.get("pending_update", "").strip()
+            if pending and os.path.isfile(pending):
+                ctk.CTkLabel(card_upd,
+                             text=f"⏳  Update ready to install on next launch:\n  {pending}",
+                             font=FONT_SMALL, text_color=Palette.SUCCESS,
+                             anchor="w", wraplength=360,
+                             justify="left").pack(fill="x", padx=16, pady=(4, 4))
+
+                def clear_pending():
+                    try:
+                        if os.path.isfile(pending):
+                            os.unlink(pending)
+                    except OSError:
+                        pass
+                    self._settings["pending_update"] = ""
+                    self._save()
+                    self._log("  Pending update cleared.", "info")
+                    win.destroy()
+                    self._open_settings()
+
+                ctk.CTkButton(card_upd, text="Cancel pending update",
+                              command=clear_pending,
+                              fg_color="transparent", border_width=1,
+                              font=FONT_SMALL).pack(
+                    anchor="w", padx=16, pady=(0, 12))
+            else:
+                ctk.CTkFrame(card_upd, height=8,
+                             fg_color="transparent").pack()
+
             # ── Danger zone card ──
             card_danger = ctk.CTkFrame(pad, corner_radius=8,
                                         border_width=1, border_color=Palette.ERROR)
@@ -1625,7 +1986,7 @@ class App:
         try:
             win = ctk.CTkToplevel(self.root)
             win.title("Version")
-            win.geometry("340x240")
+            win.geometry("340x290")
             win.resizable(False, False)
             win.transient(self.root)
             win.grab_set()
@@ -1651,9 +2012,20 @@ class App:
                 ctk.CTkLabel(row, text=value, font=FONT_MAIN,
                              anchor="w").pack(side="left", padx=(8, 0))
 
+            # Update check
+            status_label = ctk.CTkLabel(win, text="", font=FONT_SMALL,
+                                        text_color=Palette.MUTED)
+            status_label.pack(pady=(12, 0))
+
+            ctk.CTkButton(win, text="Check for Updates",
+                          command=lambda: self._manual_update_check(status_label),
+                          width=160, fg_color="transparent", border_width=1,
+                          border_color=Palette.ACCENT,
+                          text_color=Palette.ACCENT).pack(pady=(6, 4))
+
             ctk.CTkButton(win, text="Close", command=win.destroy, width=80,
                           fg_color=Palette.ACCENT,
-                          hover_color=Palette.ACCENT_HOVER).pack(pady=(14, 18))
+                          hover_color=Palette.ACCENT_HOVER).pack(pady=(4, 18))
         except Exception as e:
             self._log(f"⚠  Could not open Version: {e}", "err")
 
