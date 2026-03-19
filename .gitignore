@@ -1,0 +1,11 @@
+# PyInstaller 
+build/ 
+dist/ 
+*.spec.bak 
+# Inno Setup output 
+installer/Output/ 
+# Python 
+__pycache__/ 
+*.pyc 
+# VS Code 
+.vscode/ 
